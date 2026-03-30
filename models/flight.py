@@ -69,6 +69,9 @@ class Flight:
 
     def set_depth(self, depth):
         self.depth = depth    
+    
+    def get_rentability(self):
+        return self.rentability
     # -------------------------------------------------------------
     # Business logic
     # -------------------------------------------------------------
