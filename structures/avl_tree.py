@@ -297,10 +297,7 @@ class AVL:
         left_height = self.calculate_height(node.get_left_child())
         right_height = self.calculate_height(node.get_right_child())
 
-        if left_height > right_height:
-            return 1 + left_height
-
-        return 1 + right_height
+        return 1 + max(left_height, right_height)
 
     def get_balance_factor(self, node):
         """

@@ -59,9 +59,22 @@ class Flight:
         self.rentability = float(rentability)
 
     # -------------------------------------------------------------
+    # getter y setter
+    # -------------------------------------------------------------
+    def get_code(self):
+        return self.code
+
+    def get_depth(self):
+        return self.depth
+
+    def set_depth(self, depth):
+        self.depth = depth    
+    
+    def get_rentability(self):
+        return self.rentability
+    # -------------------------------------------------------------
     # Business logic
     # -------------------------------------------------------------
-
     def compute_final_price(self, critical_depth):
         """
         If depth > critical_depth, price increases by 25%.

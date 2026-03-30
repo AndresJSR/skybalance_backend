@@ -1,0 +1,21 @@
+{
+  "tipo": "INSERCION",
+  "ordenamiento": "codigo",
+  "vuelos": [
+    {"codigo":"SB400","origen":"Medellin","destino":"Cartagena","horaSalida":"10:00","precioBase":400,"pasajeros":120,"prioridad":2,"promocion":false,"alerta":false},
+    {"codigo":"SB250","origen":"Bogota","destino":"Cali","horaSalida":"08:00","precioBase":350,"pasajeros":90,"prioridad":1,"promocion":true,"alerta":false},
+    {"codigo":"SB150","origen":"Bogota","destino":"Pereira","horaSalida":"07:00","precioBase":280,"pasajeros":70,"prioridad":3,"promocion":false,"alerta":false},
+    {"codigo":"SB120","origen":"Cucuta","destino":"Bogota","horaSalida":"06:00","precioBase":260,"pasajeros":65,"prioridad":2,"promocion":false,"alerta":false},
+    {"codigo":"SB180","origen":"Manizales","destino":"Bogota","horaSalida":"07:30","precioBase":290,"pasajeros":75,"prioridad":1,"promocion":false,"alerta":false},
+    {"codigo":"SB300","origen":"Cali","destino":"SantaMarta","horaSalida":"09:00","precioBase":320,"pasajeros":85,"prioridad":2,"promocion":false,"alerta":false},
+    {"codigo":"SB270","origen":"Ibague","destino":"Medellin","horaSalida":"08:30","precioBase":310,"pasajeros":80,"prioridad":2,"promocion":false,"alerta":false},
+    {"codigo":"SB330","origen":"Pasto","destino":"Bogota","horaSalida":"09:30","precioBase":340,"pasajeros":88,"prioridad":1,"promocion":false,"alerta":false},
+    {"codigo":"SB600","origen":"Barranquilla","destino":"Bogota","horaSalida":"12:00","precioBase":420,"pasajeros":110,"prioridad":2,"promocion":false,"alerta":true},
+    {"codigo":"SB500","origen":"Cartagena","destino":"Medellin","horaSalida":"11:00","precioBase":390,"pasajeros":95,"prioridad":1,"promocion":false,"alerta":false},
+    {"codigo":"SB450","origen":"Bogota","destino":"SanAndres","horaSalida":"10:30","precioBase":500,"pasajeros":130,"prioridad":3,"promocion":false,"alerta":false},
+    {"codigo":"SB550","origen":"Neiva","destino":"Bogota","horaSalida":"11:30","precioBase":370,"pasajeros":92,"prioridad":2,"promocion":false,"alerta":false},
+    {"codigo":"SB700","origen":"Villavicencio","destino":"Medellin","horaSalida":"13:00","precioBase":460,"pasajeros":105,"prioridad":1,"promocion":false,"alerta":false},
+    {"codigo":"SB650","origen":"Armenia","destino":"Cali","horaSalida":"12:30","precioBase":440,"pasajeros":100,"prioridad":2,"promocion":false,"alerta":false},
+    {"codigo":"SB750","origen":"Riohacha","destino":"Bogota","horaSalida":"13:30","precioBase":480,"pasajeros":115,"prioridad":3,"promocion":false,"alerta":false}
+  ]
+}
