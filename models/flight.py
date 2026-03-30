@@ -176,4 +176,4 @@ class Flight:
         return "Flight(code=" + self.code + ", origin=" + self.origin + ", destination=" + self.destination + ")"
 
     def __repr__(self):
-        return self.__str__()
+        return self.__str__()   
