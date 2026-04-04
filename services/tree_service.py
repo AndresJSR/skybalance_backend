@@ -112,6 +112,52 @@ class TreeService:
         self.recalculate_all_metadata()
         return self.get_tree_response()
 
+    def _insert_and_check_conflicts(self, flight_data):
+        """
+        Insert a flight and return the tree response enriched with a conflict report.
+
+        Conflict types detected:
+        - critical_depth: inserted node lands beyond the critical depth threshold.
+        - rotation_triggered: insertion caused at least one AVL rotation.
+        """
+        before_rotations = dict(self.avl.get_rotation_stats())
+
+        self.save_history()
+        flight = Flight.from_dict(flight_data)
+        self.avl.insert(Node(flight))
+        self.bst.insert(Node(Flight.from_dict(flight_data)))
+        self.recalculate_all_metadata()
+
+        after_rotations = dict(self.avl.get_rotation_stats())
+
+        rotation_delta = {
+            k: after_rotations[k] - before_rotations[k]
+            for k in before_rotations
+        }
+        rotation_triggered = any(v > 0 for v in rotation_delta.values())
+
+        key = Flight.from_dict({"codigo": flight_data.get("codigo", "")})
+        inserted_node = self.avl.search(key)
+        critical_depth_hit = (
+            inserted_node is not None and inserted_node.get_value().critical_node
+        )
+
+        conflict_types = []
+        if critical_depth_hit:
+            conflict_types.append("critical_depth")
+        if rotation_triggered:
+            conflict_types.append("rotation_triggered")
+
+        result = self.get_tree_response()
+        result["conflict"] = {
+            "hasConflict": len(conflict_types) > 0,
+            "types": conflict_types,
+            "rotationDelta": rotation_delta,
+            "criticalDepth": critical_depth_hit,
+            "rotationTriggered": rotation_triggered,
+        }
+        return result
+
     def update_flight(self, code, updates):
         key = Flight.from_dict({"codigo": code})
         node = self.avl.search(key)
@@ -258,7 +304,7 @@ class TreeService:
             return {"error": "La cola está vacía."}
 
         with self.tree_lock:
-            result = self.insert_flight(flight_data)
+            result = self._insert_and_check_conflicts(flight_data)
 
         with self.queue_lock:
             remaining = self.queue.size()
@@ -269,6 +315,7 @@ class TreeService:
 
     def process_full_queue(self):
         inserted_codes = []
+        conflicts = []
 
         while True:
             with self.queue_lock:
@@ -278,12 +325,23 @@ class TreeService:
                 flight_data = self.queue.dequeue()
 
             with self.tree_lock:
-                self.insert_flight(flight_data)
+                insert_result = self._insert_and_check_conflicts(flight_data)
 
-            inserted_codes.append(str(flight_data.get("codigo", "")))
+            code = str(flight_data.get("codigo", ""))
+            inserted_codes.append(code)
+
+            if insert_result["conflict"]["hasConflict"]:
+                conflicts.append({
+                    "codigo": code,
+                    "types": insert_result["conflict"]["types"],
+                    "rotationDelta": insert_result["conflict"]["rotationDelta"],
+                    "criticalDepth": insert_result["conflict"]["criticalDepth"],
+                    "rotationTriggered": insert_result["conflict"]["rotationTriggered"],
+                })
 
         response = self.get_tree_response()
         response["insertedCodes"] = inserted_codes
+        response["conflicts"] = conflicts
         return response
 
     def list_queue(self):
@@ -354,6 +412,7 @@ class TreeService:
             "processed": 0,
             "inserted": 0,
             "failed": 0,
+            "warnings": 0,
             "stopRequested": False,
             "startedAt": started_at,
             "endedAt": None,
@@ -490,9 +549,11 @@ class TreeService:
 
             try:
                 with self.tree_lock:
-                    self.insert_flight(flight_data)
+                    insert_result = self._insert_and_check_conflicts(flight_data)
                     avl_summary = self.get_avl_summary()
                     bst_summary = self.get_bst_summary()
+
+                conflict = insert_result["conflict"]
 
                 self._append_simulation_event(
                     job_id,
@@ -502,6 +563,7 @@ class TreeService:
                     None,
                     avl_summary,
                     bst_summary,
+                    conflict=conflict,
                 )
 
                 with self.simulation_lock:
@@ -509,6 +571,8 @@ class TreeService:
                     if simulation is not None:
                         simulation["processed"] += 1
                         simulation["inserted"] += 1
+                        if conflict["hasConflict"]:
+                            simulation["warnings"] += 1
 
             except ValueError as error:
                 self._append_simulation_event(
@@ -556,6 +620,7 @@ class TreeService:
         message,
         avl_summary,
         bst_summary,
+        conflict=None,
     ):
         event = {
             "timestamp": datetime.utcnow().isoformat() + "Z",
@@ -565,6 +630,7 @@ class TreeService:
             "message": message,
             "avl": avl_summary,
             "bst": bst_summary,
+            "conflict": conflict,
         }
 
         with self.simulation_lock:
@@ -589,6 +655,7 @@ class TreeService:
             "processed": simulation["processed"],
             "inserted": simulation["inserted"],
             "failed": simulation["failed"],
+            "warnings": simulation["warnings"],
             "stopRequested": simulation["stopRequested"],
             "startedAt": simulation["startedAt"],
             "endedAt": simulation["endedAt"],
