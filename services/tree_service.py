@@ -1,5 +1,10 @@
 """Main application service for the SkyBalance backend."""
 
+import threading
+import time
+import uuid
+from datetime import datetime
+
 from models.flight import Flight
 from structures.node import Node
 from structures.avl_tree import AVL
@@ -32,6 +37,10 @@ class TreeService:
         self.versions = {}
         self.load_mode = None
         self.critical_depth = 999
+        self.queue_lock = threading.Lock()
+        self.tree_lock = threading.Lock()
+        self.simulation_lock = threading.Lock()
+        self.simulations = {}
 
     # -------------------------------------------------------------
     # Load / reset
@@ -204,11 +213,10 @@ class TreeService:
 
         self.save_history()
 
-        snapshot = self.versions[name]
-        if snapshot is None:
+        if self.versions[name] is None:
             self.avl.root = None
         else:
-            self.avl.root = JsonLoader.build_topology_tree(snapshot, None, 0)
+            self.avl.root = JsonLoader.build_topology_tree(self.versions[name], None, 0)
 
         self.recalculate_all_metadata()
         response = self.get_tree_response()
@@ -233,29 +241,45 @@ class TreeService:
     # -------------------------------------------------------------
 
     def enqueue_flight(self, flight_data):
-        self.queue.enqueue(flight_data)
+        with self.queue_lock:
+            self.queue.enqueue(flight_data)
+            pending = self.queue.to_list()
+
         return {
-            "queued": self.queue.size(),
-            "pending": self.queue.to_list()
+            "queued": len(pending),
+            "pending": pending
         }
 
     def process_next_in_queue(self):
-        flight_data = self.queue.dequeue()
+        with self.queue_lock:
+            flight_data = self.queue.dequeue()
 
         if flight_data is None:
             return {"error": "La cola está vacía."}
 
-        result = self.insert_flight(flight_data)
+        with self.tree_lock:
+            result = self.insert_flight(flight_data)
+
+        with self.queue_lock:
+            remaining = self.queue.size()
+
         result["inserted"] = flight_data
-        result["remaining"] = self.queue.size()
+        result["remaining"] = remaining
         return result
 
     def process_full_queue(self):
         inserted_codes = []
 
-        while not self.queue.is_empty():
-            flight_data = self.queue.dequeue()
-            self.insert_flight(flight_data)
+        while True:
+            with self.queue_lock:
+                if self.queue.is_empty():
+                    break
+
+                flight_data = self.queue.dequeue()
+
+            with self.tree_lock:
+                self.insert_flight(flight_data)
+
             inserted_codes.append(str(flight_data.get("codigo", "")))
 
         response = self.get_tree_response()
@@ -263,20 +287,313 @@ class TreeService:
         return response
 
     def list_queue(self):
+        with self.queue_lock:
+            size = self.queue.size()
+            pending = self.queue.to_list()
+
         return {
-            "size": self.queue.size(),
-            "pending": self.queue.to_list()
+            "size": size,
+            "pending": pending
         }
 
     def remove_from_queue(self, code):
-        removed = self.queue.remove_by_code(code)
+        with self.queue_lock:
+            removed = self.queue.remove_by_code(code)
+            remaining = self.queue.size()
 
         if not removed:
             return {"error": "Ese vuelo no está en la cola."}
 
         return {
             "removed": code,
-            "remaining": self.queue.size()
+            "remaining": remaining
+        }
+
+    def start_parallel_queue_simulation(self, workers=2, max_items=None, delay_ms=0):
+        workers = int(workers)
+        delay_ms = int(delay_ms)
+
+        if workers <= 0:
+            return {"error": "El número de workers debe ser mayor que cero."}
+
+        if delay_ms < 0:
+            return {"error": "delayMs no puede ser negativo."}
+
+        if max_items is not None:
+            max_items = int(max_items)
+            if max_items <= 0:
+                return {"error": "maxItems debe ser mayor que cero."}
+
+        with self.simulation_lock:
+            for simulation in self.simulations.values():
+                if simulation["status"] == "running":
+                    return {
+                        "error": "Ya existe una simulación activa.",
+                        "activeJobId": simulation["jobId"],
+                    }
+
+        with self.queue_lock:
+            queue_size = self.queue.size()
+
+        if queue_size == 0:
+            return {"error": "La cola está vacía."}
+
+        target_total = queue_size if max_items is None else min(queue_size, max_items)
+        job_id = str(uuid.uuid4())
+        started_at = datetime.utcnow().isoformat() + "Z"
+
+        simulation = {
+            "jobId": job_id,
+            "status": "running",
+            "workers": workers,
+            "delayMs": delay_ms,
+            "maxItems": max_items,
+            "queueSizeAtStart": queue_size,
+            "total": target_total,
+            "claimed": 0,
+            "processed": 0,
+            "inserted": 0,
+            "failed": 0,
+            "stopRequested": False,
+            "startedAt": started_at,
+            "endedAt": None,
+            "events": [],
+        }
+
+        worker_threads = []
+
+        with self.simulation_lock:
+            self.simulations[job_id] = simulation
+
+        for worker_id in range(1, workers + 1):
+            thread = threading.Thread(
+                target=self._parallel_simulation_worker,
+                args=(job_id, worker_id),
+                daemon=True,
+            )
+            thread.start()
+            worker_threads.append(thread)
+
+        monitor = threading.Thread(
+            target=self._parallel_simulation_monitor,
+            args=(job_id, worker_threads),
+            daemon=True,
+        )
+        monitor.start()
+
+        return {
+            "jobId": job_id,
+            "status": "running",
+            "workers": workers,
+            "total": target_total,
+            "queueSizeAtStart": queue_size,
+            "startedAt": started_at,
+        }
+
+    def stop_parallel_queue_simulation(self, job_id):
+        with self.simulation_lock:
+            simulation = self.simulations.get(job_id)
+
+            if simulation is None:
+                return {"error": "La simulación no existe."}
+
+            if simulation["status"] != "running":
+                return {
+                    "error": "La simulación no está en ejecución.",
+                    "status": simulation["status"],
+                }
+
+            simulation["stopRequested"] = True
+
+            return {
+                "jobId": job_id,
+                "status": simulation["status"],
+                "stopRequested": True,
+            }
+
+    def get_parallel_simulation_status(self, job_id):
+        with self.simulation_lock:
+            simulation = self.simulations.get(job_id)
+
+            if simulation is None:
+                return {"error": "La simulación no existe."}
+
+            return self._build_simulation_status(simulation)
+
+    def list_parallel_simulation_events(self, job_id, offset=0, limit=100):
+        offset = int(offset)
+        limit = int(limit)
+
+        if offset < 0:
+            return {"error": "offset no puede ser negativo."}
+
+        if limit <= 0:
+            return {"error": "limit debe ser mayor que cero."}
+
+        with self.simulation_lock:
+            simulation = self.simulations.get(job_id)
+
+            if simulation is None:
+                return {"error": "La simulación no existe."}
+
+            events = simulation["events"]
+            selected = events[offset:offset + limit]
+
+            return {
+                "jobId": job_id,
+                "status": simulation["status"],
+                "offset": offset,
+                "limit": limit,
+                "totalEvents": len(events),
+                "events": selected,
+            }
+
+    def _parallel_simulation_worker(self, job_id, worker_id):
+        while True:
+            with self.simulation_lock:
+                simulation = self.simulations.get(job_id)
+
+                if simulation is None:
+                    return
+
+                if simulation["stopRequested"]:
+                    return
+
+                if simulation["claimed"] >= simulation["total"]:
+                    return
+
+                simulation["claimed"] += 1
+                delay_ms = simulation["delayMs"]
+
+            with self.queue_lock:
+                flight_data = self.queue.dequeue()
+
+            if flight_data is None:
+                self._append_simulation_event(
+                    job_id,
+                    worker_id,
+                    None,
+                    "error",
+                    "La cola no tenía suficientes elementos para completar la simulación.",
+                    None,
+                    None,
+                )
+
+                with self.simulation_lock:
+                    simulation = self.simulations.get(job_id)
+                    if simulation is not None:
+                        simulation["processed"] += 1
+                        simulation["failed"] += 1
+                continue
+
+            code = str(flight_data.get("codigo", ""))
+
+            try:
+                with self.tree_lock:
+                    self.insert_flight(flight_data)
+                    avl_summary = self.get_avl_summary()
+                    bst_summary = self.get_bst_summary()
+
+                self._append_simulation_event(
+                    job_id,
+                    worker_id,
+                    code,
+                    "inserted",
+                    None,
+                    avl_summary,
+                    bst_summary,
+                )
+
+                with self.simulation_lock:
+                    simulation = self.simulations.get(job_id)
+                    if simulation is not None:
+                        simulation["processed"] += 1
+                        simulation["inserted"] += 1
+
+            except ValueError as error:
+                self._append_simulation_event(
+                    job_id,
+                    worker_id,
+                    code,
+                    "error",
+                    str(error),
+                    None,
+                    None,
+                )
+
+                with self.simulation_lock:
+                    simulation = self.simulations.get(job_id)
+                    if simulation is not None:
+                        simulation["processed"] += 1
+                        simulation["failed"] += 1
+
+            if delay_ms > 0:
+                time.sleep(delay_ms / 1000.0)
+
+    def _parallel_simulation_monitor(self, job_id, worker_threads):
+        for thread in worker_threads:
+            thread.join()
+
+        with self.simulation_lock:
+            simulation = self.simulations.get(job_id)
+
+            if simulation is None:
+                return
+
+            simulation["endedAt"] = datetime.utcnow().isoformat() + "Z"
+
+            if simulation["stopRequested"]:
+                simulation["status"] = "stopped"
+            else:
+                simulation["status"] = "completed"
+
+    def _append_simulation_event(
+        self,
+        job_id,
+        worker_id,
+        code,
+        result,
+        message,
+        avl_summary,
+        bst_summary,
+    ):
+        event = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "workerId": worker_id,
+            "codigo": code,
+            "result": result,
+            "message": message,
+            "avl": avl_summary,
+            "bst": bst_summary,
+        }
+
+        with self.simulation_lock:
+            simulation = self.simulations.get(job_id)
+            if simulation is not None:
+                simulation["events"].append(event)
+
+    def _build_simulation_status(self, simulation):
+        progress = 0.0
+        if simulation["total"] > 0:
+            progress = round((simulation["processed"] / simulation["total"]) * 100.0, 2)
+
+        return {
+            "jobId": simulation["jobId"],
+            "status": simulation["status"],
+            "workers": simulation["workers"],
+            "delayMs": simulation["delayMs"],
+            "maxItems": simulation["maxItems"],
+            "queueSizeAtStart": simulation["queueSizeAtStart"],
+            "total": simulation["total"],
+            "claimed": simulation["claimed"],
+            "processed": simulation["processed"],
+            "inserted": simulation["inserted"],
+            "failed": simulation["failed"],
+            "stopRequested": simulation["stopRequested"],
+            "startedAt": simulation["startedAt"],
+            "endedAt": simulation["endedAt"],
+            "progressPercent": progress,
+            "lastEvents": simulation["events"][-10:],
         }
 
     # -------------------------------------------------------------
