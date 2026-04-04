@@ -1,9 +1,13 @@
 """Main application service for the SkyBalance backend."""
 
+import json
+import os
 import threading
 import time
 import uuid
 from datetime import datetime
+
+VERSIONS_FILE = os.path.join(os.path.dirname(__file__), "..", "versions_store.json")
 
 from models.flight import Flight
 from structures.node import Node
@@ -38,9 +42,11 @@ class TreeService:
         self.load_mode = None
         self.critical_depth = 999
         self.queue_lock = threading.Lock()
+        self.versions_lock = threading.Lock()
         self.tree_lock = threading.Lock()
         self.simulation_lock = threading.Lock()
         self.simulations = {}
+        self._load_versions_from_disk()
 
     # -------------------------------------------------------------
     # Load / reset
@@ -51,7 +57,8 @@ class TreeService:
         self.bst = BST()
         self.history.clear()
         self.queue.clear()
-        self.versions.clear()
+        # Versions are persistent named snapshots managed explicitly by the user.
+        # They survive loading a new JSON file and server restarts.
         self.load_mode = None
         self.critical_depth = 999
 
@@ -247,22 +254,33 @@ class TreeService:
     # -------------------------------------------------------------
 
     def save_version(self, name):
-        self.versions[name] = JsonSerializer.serialize_tree(self.avl.get_root())
+        with self.versions_lock:
+            self.versions[name] = JsonSerializer.serialize_tree(self.avl.get_root())
+            keys = list(self.versions.keys())
+
+        self._persist_versions_to_disk()
+
         return {
             "saved": name,
-            "versions": list(self.versions.keys())
+            "versions": keys,
         }
 
     def restore_version(self, name):
-        if name not in self.versions:
+        with self.versions_lock:
+            exists = name in self.versions
+
+        if not exists:
             return {"error": "La versión no existe."}
 
         self.save_history()
 
-        if self.versions[name] is None:
+        with self.versions_lock:
+            snapshot = self.versions[name]
+
+        if snapshot is None:
             self.avl.root = None
         else:
-            self.avl.root = JsonLoader.build_topology_tree(self.versions[name], None, 0)
+            self.avl.root = JsonLoader.build_topology_tree(snapshot, None, 0)
 
         self.recalculate_all_metadata()
         response = self.get_tree_response()
@@ -270,17 +288,64 @@ class TreeService:
         return response
 
     def list_versions(self):
-        return list(self.versions.keys())
+        with self.versions_lock:
+            return list(self.versions.keys())
 
     def delete_version(self, name):
-        if name not in self.versions:
-            return {"error": "La versión no existe."}
+        with self.versions_lock:
+            if name not in self.versions:
+                return {"error": "La versión no existe."}
 
-        del self.versions[name]
+            del self.versions[name]
+            keys = list(self.versions.keys())
+
+        self._persist_versions_to_disk()
+
         return {
             "deleted": name,
-            "versions": list(self.versions.keys())
+            "versions": keys,
         }
+
+    def _load_versions_from_disk(self):
+        """
+        Load saved versions from disk into memory on service startup.
+        Silently ignores missing or corrupt files.
+        """
+        path = os.path.abspath(VERSIONS_FILE)
+
+        if not os.path.isfile(path):
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+
+            if isinstance(data, dict):
+                with self.versions_lock:
+                    self.versions = data
+
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    def _persist_versions_to_disk(self):
+        """
+        Write all current versions to disk atomically.
+        Uses a .tmp file + rename to avoid partial writes.
+        """
+        path = os.path.abspath(VERSIONS_FILE)
+        tmp_path = path + ".tmp"
+
+        with self.versions_lock:
+            snapshot = dict(self.versions)
+
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(snapshot, fh, ensure_ascii=False, indent=2)
+
+            os.replace(tmp_path, path)
+
+        except OSError:
+            pass
 
     # -------------------------------------------------------------
     # Queue
