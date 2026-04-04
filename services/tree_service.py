@@ -1,5 +1,14 @@
 """Main application service for the SkyBalance backend."""
 
+import json
+import os
+import threading
+import time
+import uuid
+from datetime import datetime
+
+VERSIONS_FILE = os.path.join(os.path.dirname(__file__), "..", "versions_store.json")
+
 from models.flight import Flight
 from structures.node import Node
 from structures.avl_tree import AVL
@@ -32,6 +41,12 @@ class TreeService:
         self.versions = {}
         self.load_mode = None
         self.critical_depth = 999
+        self.queue_lock = threading.Lock()
+        self.versions_lock = threading.Lock()
+        self.tree_lock = threading.Lock()
+        self.simulation_lock = threading.Lock()
+        self.simulations = {}
+        self._load_versions_from_disk()
 
     # -------------------------------------------------------------
     # Load / reset
@@ -42,7 +57,8 @@ class TreeService:
         self.bst = BST()
         self.history.clear()
         self.queue.clear()
-        self.versions.clear()
+        # Versions are persistent named snapshots managed explicitly by the user.
+        # They survive loading a new JSON file and server restarts.
         self.load_mode = None
         self.critical_depth = 999
 
@@ -102,6 +118,52 @@ class TreeService:
         self.bst.insert(Node(Flight.from_dict(flight_data)))
         self.recalculate_all_metadata()
         return self.get_tree_response()
+
+    def _insert_and_check_conflicts(self, flight_data):
+        """
+        Insert a flight and return the tree response enriched with a conflict report.
+
+        Conflict types detected:
+        - critical_depth: inserted node lands beyond the critical depth threshold.
+        - rotation_triggered: insertion caused at least one AVL rotation.
+        """
+        before_rotations = dict(self.avl.get_rotation_stats())
+
+        self.save_history()
+        flight = Flight.from_dict(flight_data)
+        self.avl.insert(Node(flight))
+        self.bst.insert(Node(Flight.from_dict(flight_data)))
+        self.recalculate_all_metadata()
+
+        after_rotations = dict(self.avl.get_rotation_stats())
+
+        rotation_delta = {
+            k: after_rotations[k] - before_rotations[k]
+            for k in before_rotations
+        }
+        rotation_triggered = any(v > 0 for v in rotation_delta.values())
+
+        key = Flight.from_dict({"codigo": flight_data.get("codigo", "")})
+        inserted_node = self.avl.search(key)
+        critical_depth_hit = (
+            inserted_node is not None and inserted_node.get_value().critical_node
+        )
+
+        conflict_types = []
+        if critical_depth_hit:
+            conflict_types.append("critical_depth")
+        if rotation_triggered:
+            conflict_types.append("rotation_triggered")
+
+        result = self.get_tree_response()
+        result["conflict"] = {
+            "hasConflict": len(conflict_types) > 0,
+            "types": conflict_types,
+            "rotationDelta": rotation_delta,
+            "criticalDepth": critical_depth_hit,
+            "rotationTriggered": rotation_triggered,
+        }
+        return result
 
     def update_flight(self, code, updates):
         key = Flight.from_dict({"codigo": code})
@@ -192,19 +254,29 @@ class TreeService:
     # -------------------------------------------------------------
 
     def save_version(self, name):
-        self.versions[name] = JsonSerializer.serialize_tree(self.avl.get_root())
+        with self.versions_lock:
+            self.versions[name] = JsonSerializer.serialize_tree(self.avl.get_root())
+            keys = list(self.versions.keys())
+
+        self._persist_versions_to_disk()
+
         return {
             "saved": name,
-            "versions": list(self.versions.keys())
+            "versions": keys,
         }
 
     def restore_version(self, name):
-        if name not in self.versions:
+        with self.versions_lock:
+            exists = name in self.versions
+
+        if not exists:
             return {"error": "La versión no existe."}
 
         self.save_history()
 
-        snapshot = self.versions[name]
+        with self.versions_lock:
+            snapshot = self.versions[name]
+
         if snapshot is None:
             self.avl.root = None
         else:
@@ -216,67 +288,444 @@ class TreeService:
         return response
 
     def list_versions(self):
-        return list(self.versions.keys())
+        with self.versions_lock:
+            return list(self.versions.keys())
 
     def delete_version(self, name):
-        if name not in self.versions:
-            return {"error": "La versión no existe."}
+        with self.versions_lock:
+            if name not in self.versions:
+                return {"error": "La versión no existe."}
 
-        del self.versions[name]
+            del self.versions[name]
+            keys = list(self.versions.keys())
+
+        self._persist_versions_to_disk()
+
         return {
             "deleted": name,
-            "versions": list(self.versions.keys())
+            "versions": keys,
         }
+
+    def _load_versions_from_disk(self):
+        """
+        Load saved versions from disk into memory on service startup.
+        Silently ignores missing or corrupt files.
+        """
+        path = os.path.abspath(VERSIONS_FILE)
+
+        if not os.path.isfile(path):
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+
+            if isinstance(data, dict):
+                with self.versions_lock:
+                    self.versions = data
+
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    def _persist_versions_to_disk(self):
+        """
+        Write all current versions to disk atomically.
+        Uses a .tmp file + rename to avoid partial writes.
+        """
+        path = os.path.abspath(VERSIONS_FILE)
+        tmp_path = path + ".tmp"
+
+        with self.versions_lock:
+            snapshot = dict(self.versions)
+
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(snapshot, fh, ensure_ascii=False, indent=2)
+
+            os.replace(tmp_path, path)
+
+        except OSError:
+            pass
 
     # -------------------------------------------------------------
     # Queue
     # -------------------------------------------------------------
 
     def enqueue_flight(self, flight_data):
-        self.queue.enqueue(flight_data)
+        with self.queue_lock:
+            self.queue.enqueue(flight_data)
+            pending = self.queue.to_list()
+
         return {
-            "queued": self.queue.size(),
-            "pending": self.queue.to_list()
+            "queued": len(pending),
+            "pending": pending
         }
 
     def process_next_in_queue(self):
-        flight_data = self.queue.dequeue()
+        with self.queue_lock:
+            flight_data = self.queue.dequeue()
 
         if flight_data is None:
             return {"error": "La cola está vacía."}
 
-        result = self.insert_flight(flight_data)
+        with self.tree_lock:
+            result = self._insert_and_check_conflicts(flight_data)
+
+        with self.queue_lock:
+            remaining = self.queue.size()
+
         result["inserted"] = flight_data
-        result["remaining"] = self.queue.size()
+        result["remaining"] = remaining
         return result
 
     def process_full_queue(self):
         inserted_codes = []
+        conflicts = []
 
-        while not self.queue.is_empty():
-            flight_data = self.queue.dequeue()
-            self.insert_flight(flight_data)
-            inserted_codes.append(str(flight_data.get("codigo", "")))
+        while True:
+            with self.queue_lock:
+                if self.queue.is_empty():
+                    break
+
+                flight_data = self.queue.dequeue()
+
+            with self.tree_lock:
+                insert_result = self._insert_and_check_conflicts(flight_data)
+
+            code = str(flight_data.get("codigo", ""))
+            inserted_codes.append(code)
+
+            if insert_result["conflict"]["hasConflict"]:
+                conflicts.append({
+                    "codigo": code,
+                    "types": insert_result["conflict"]["types"],
+                    "rotationDelta": insert_result["conflict"]["rotationDelta"],
+                    "criticalDepth": insert_result["conflict"]["criticalDepth"],
+                    "rotationTriggered": insert_result["conflict"]["rotationTriggered"],
+                })
 
         response = self.get_tree_response()
         response["insertedCodes"] = inserted_codes
+        response["conflicts"] = conflicts
         return response
 
     def list_queue(self):
+        with self.queue_lock:
+            size = self.queue.size()
+            pending = self.queue.to_list()
+
         return {
-            "size": self.queue.size(),
-            "pending": self.queue.to_list()
+            "size": size,
+            "pending": pending
         }
 
     def remove_from_queue(self, code):
-        removed = self.queue.remove_by_code(code)
+        with self.queue_lock:
+            removed = self.queue.remove_by_code(code)
+            remaining = self.queue.size()
 
         if not removed:
             return {"error": "Ese vuelo no está en la cola."}
 
         return {
             "removed": code,
-            "remaining": self.queue.size()
+            "remaining": remaining
+        }
+
+    def start_parallel_queue_simulation(self, workers=2, max_items=None, delay_ms=0):
+        workers = int(workers)
+        delay_ms = int(delay_ms)
+
+        if workers <= 0:
+            return {"error": "El número de workers debe ser mayor que cero."}
+
+        if delay_ms < 0:
+            return {"error": "delayMs no puede ser negativo."}
+
+        if max_items is not None:
+            max_items = int(max_items)
+            if max_items <= 0:
+                return {"error": "maxItems debe ser mayor que cero."}
+
+        with self.simulation_lock:
+            for simulation in self.simulations.values():
+                if simulation["status"] == "running":
+                    return {
+                        "error": "Ya existe una simulación activa.",
+                        "activeJobId": simulation["jobId"],
+                    }
+
+        with self.queue_lock:
+            queue_size = self.queue.size()
+
+        if queue_size == 0:
+            return {"error": "La cola está vacía."}
+
+        target_total = queue_size if max_items is None else min(queue_size, max_items)
+        job_id = str(uuid.uuid4())
+        started_at = datetime.utcnow().isoformat() + "Z"
+
+        simulation = {
+            "jobId": job_id,
+            "status": "running",
+            "workers": workers,
+            "delayMs": delay_ms,
+            "maxItems": max_items,
+            "queueSizeAtStart": queue_size,
+            "total": target_total,
+            "claimed": 0,
+            "processed": 0,
+            "inserted": 0,
+            "failed": 0,
+            "warnings": 0,
+            "stopRequested": False,
+            "startedAt": started_at,
+            "endedAt": None,
+            "events": [],
+        }
+
+        worker_threads = []
+
+        with self.simulation_lock:
+            self.simulations[job_id] = simulation
+
+        for worker_id in range(1, workers + 1):
+            thread = threading.Thread(
+                target=self._parallel_simulation_worker,
+                args=(job_id, worker_id),
+                daemon=True,
+            )
+            thread.start()
+            worker_threads.append(thread)
+
+        monitor = threading.Thread(
+            target=self._parallel_simulation_monitor,
+            args=(job_id, worker_threads),
+            daemon=True,
+        )
+        monitor.start()
+
+        return {
+            "jobId": job_id,
+            "status": "running",
+            "workers": workers,
+            "total": target_total,
+            "queueSizeAtStart": queue_size,
+            "startedAt": started_at,
+        }
+
+    def stop_parallel_queue_simulation(self, job_id):
+        with self.simulation_lock:
+            simulation = self.simulations.get(job_id)
+
+            if simulation is None:
+                return {"error": "La simulación no existe."}
+
+            if simulation["status"] != "running":
+                return {
+                    "error": "La simulación no está en ejecución.",
+                    "status": simulation["status"],
+                }
+
+            simulation["stopRequested"] = True
+
+            return {
+                "jobId": job_id,
+                "status": simulation["status"],
+                "stopRequested": True,
+            }
+
+    def get_parallel_simulation_status(self, job_id):
+        with self.simulation_lock:
+            simulation = self.simulations.get(job_id)
+
+            if simulation is None:
+                return {"error": "La simulación no existe."}
+
+            return self._build_simulation_status(simulation)
+
+    def list_parallel_simulation_events(self, job_id, offset=0, limit=100):
+        offset = int(offset)
+        limit = int(limit)
+
+        if offset < 0:
+            return {"error": "offset no puede ser negativo."}
+
+        if limit <= 0:
+            return {"error": "limit debe ser mayor que cero."}
+
+        with self.simulation_lock:
+            simulation = self.simulations.get(job_id)
+
+            if simulation is None:
+                return {"error": "La simulación no existe."}
+
+            events = simulation["events"]
+            selected = events[offset:offset + limit]
+
+            return {
+                "jobId": job_id,
+                "status": simulation["status"],
+                "offset": offset,
+                "limit": limit,
+                "totalEvents": len(events),
+                "events": selected,
+            }
+
+    def _parallel_simulation_worker(self, job_id, worker_id):
+        while True:
+            with self.simulation_lock:
+                simulation = self.simulations.get(job_id)
+
+                if simulation is None:
+                    return
+
+                if simulation["stopRequested"]:
+                    return
+
+                if simulation["claimed"] >= simulation["total"]:
+                    return
+
+                simulation["claimed"] += 1
+                delay_ms = simulation["delayMs"]
+
+            with self.queue_lock:
+                flight_data = self.queue.dequeue()
+
+            if flight_data is None:
+                self._append_simulation_event(
+                    job_id,
+                    worker_id,
+                    None,
+                    "error",
+                    "La cola no tenía suficientes elementos para completar la simulación.",
+                    None,
+                    None,
+                )
+
+                with self.simulation_lock:
+                    simulation = self.simulations.get(job_id)
+                    if simulation is not None:
+                        simulation["processed"] += 1
+                        simulation["failed"] += 1
+                continue
+
+            code = str(flight_data.get("codigo", ""))
+
+            try:
+                with self.tree_lock:
+                    insert_result = self._insert_and_check_conflicts(flight_data)
+                    avl_summary = self.get_avl_summary()
+                    bst_summary = self.get_bst_summary()
+
+                conflict = insert_result["conflict"]
+
+                self._append_simulation_event(
+                    job_id,
+                    worker_id,
+                    code,
+                    "inserted",
+                    None,
+                    avl_summary,
+                    bst_summary,
+                    conflict=conflict,
+                )
+
+                with self.simulation_lock:
+                    simulation = self.simulations.get(job_id)
+                    if simulation is not None:
+                        simulation["processed"] += 1
+                        simulation["inserted"] += 1
+                        if conflict["hasConflict"]:
+                            simulation["warnings"] += 1
+
+            except ValueError as error:
+                self._append_simulation_event(
+                    job_id,
+                    worker_id,
+                    code,
+                    "error",
+                    str(error),
+                    None,
+                    None,
+                )
+
+                with self.simulation_lock:
+                    simulation = self.simulations.get(job_id)
+                    if simulation is not None:
+                        simulation["processed"] += 1
+                        simulation["failed"] += 1
+
+            if delay_ms > 0:
+                time.sleep(delay_ms / 1000.0)
+
+    def _parallel_simulation_monitor(self, job_id, worker_threads):
+        for thread in worker_threads:
+            thread.join()
+
+        with self.simulation_lock:
+            simulation = self.simulations.get(job_id)
+
+            if simulation is None:
+                return
+
+            simulation["endedAt"] = datetime.utcnow().isoformat() + "Z"
+
+            if simulation["stopRequested"]:
+                simulation["status"] = "stopped"
+            else:
+                simulation["status"] = "completed"
+
+    def _append_simulation_event(
+        self,
+        job_id,
+        worker_id,
+        code,
+        result,
+        message,
+        avl_summary,
+        bst_summary,
+        conflict=None,
+    ):
+        event = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "workerId": worker_id,
+            "codigo": code,
+            "result": result,
+            "message": message,
+            "avl": avl_summary,
+            "bst": bst_summary,
+            "conflict": conflict,
+        }
+
+        with self.simulation_lock:
+            simulation = self.simulations.get(job_id)
+            if simulation is not None:
+                simulation["events"].append(event)
+
+    def _build_simulation_status(self, simulation):
+        progress = 0.0
+        if simulation["total"] > 0:
+            progress = round((simulation["processed"] / simulation["total"]) * 100.0, 2)
+
+        return {
+            "jobId": simulation["jobId"],
+            "status": simulation["status"],
+            "workers": simulation["workers"],
+            "delayMs": simulation["delayMs"],
+            "maxItems": simulation["maxItems"],
+            "queueSizeAtStart": simulation["queueSizeAtStart"],
+            "total": simulation["total"],
+            "claimed": simulation["claimed"],
+            "processed": simulation["processed"],
+            "inserted": simulation["inserted"],
+            "failed": simulation["failed"],
+            "warnings": simulation["warnings"],
+            "stopRequested": simulation["stopRequested"],
+            "startedAt": simulation["startedAt"],
+            "endedAt": simulation["endedAt"],
+            "progressPercent": progress,
+            "lastEvents": simulation["events"][-10:],
         }
 
     # -------------------------------------------------------------

@@ -82,3 +82,102 @@ def remove_from_queue(code):
 
     except Exception as e:
         return error_response("Error al eliminar de la cola: " + str(e), 500)
+
+
+@queue_bp.route("/queue/simulations/start", methods=["POST"])
+def start_parallel_simulation():
+    """
+    Start a parallel insertion simulation using N workers.
+
+    Expected body (all optional):
+    {
+        "workers": 3,
+        "maxItems": 20,
+        "delayMs": 100
+    }
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+
+        workers = data.get("workers", 2)
+        max_items = data.get("maxItems")
+        delay_ms = data.get("delayMs", 0)
+
+        result = service.start_parallel_queue_simulation(
+            workers=workers,
+            max_items=max_items,
+            delay_ms=delay_ms,
+        )
+
+        if "error" in result:
+            return error_response(result["error"], 400)
+
+        return success_response(result, 202)
+
+    except ValueError as e:
+        return error_response(str(e), 400)
+
+    except Exception as e:
+        return error_response("Error al iniciar simulación paralela: " + str(e), 500)
+
+
+@queue_bp.route("/queue/simulations/<job_id>", methods=["GET"])
+def get_parallel_simulation_status(job_id):
+    """
+    Get the current status for a parallel insertion simulation.
+    """
+    try:
+        result = service.get_parallel_simulation_status(job_id)
+
+        if "error" in result:
+            return error_response(result["error"], 404)
+
+        return success_response(result, 200)
+
+    except Exception as e:
+        return error_response("Error al consultar simulación paralela: " + str(e), 500)
+
+
+@queue_bp.route("/queue/simulations/<job_id>/events", methods=["GET"])
+def get_parallel_simulation_events(job_id):
+    """
+    Get paginated simulation events for a parallel insertion job.
+    Query params:
+    - offset (default 0)
+    - limit (default 100)
+    """
+    try:
+        offset = request.args.get("offset", 0, type=int)
+        limit = request.args.get("limit", 100, type=int)
+
+        result = service.list_parallel_simulation_events(job_id, offset=offset, limit=limit)
+
+        if "error" in result:
+            status = 404 if result["error"] == "La simulación no existe." else 400
+            return error_response(result["error"], status)
+
+        return success_response(result, 200)
+
+    except ValueError as e:
+        return error_response(str(e), 400)
+
+    except Exception as e:
+        return error_response("Error al obtener eventos de simulación: " + str(e), 500)
+
+
+@queue_bp.route("/queue/simulations/<job_id>/stop", methods=["POST"])
+def stop_parallel_simulation(job_id):
+    """
+    Request a running simulation to stop.
+    """
+    try:
+        result = service.stop_parallel_queue_simulation(job_id)
+
+        if "error" in result:
+            status = 404 if result["error"] == "La simulación no existe." else 400
+            return error_response(result["error"], status)
+
+        return success_response(result, 200)
+
+    except Exception as e:
+        return error_response("Error al detener simulación paralela: " + str(e), 500)
