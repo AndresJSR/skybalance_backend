@@ -1,13 +1,9 @@
 """Main application service for the SkyBalance backend."""
 
-import json
-import os
 import threading
 import time
 import uuid
 from datetime import datetime
-
-VERSIONS_FILE = os.path.join(os.path.dirname(__file__), "..", "versions_store.json")
 
 from models.flight import Flight
 from structures.node import Node
@@ -17,6 +13,12 @@ from structures.history_stack import HistoryStack
 from structures.insertion_queue import InsertionQueue
 from persistence.json_loader import JsonLoader
 from persistence.json_serializer import JsonSerializer
+from services.audit_service import AuditService
+from services.metrics_service import MetricsService
+from services.pricing_service import PricingService
+from services.queue_service import QueueService
+from services.simulation_service import SimulationService
+from services.version_service import VersionService
 
 
 class TreeService:
@@ -38,15 +40,18 @@ class TreeService:
         self.bst = BST()
         self.history = HistoryStack(max_size=50)
         self.queue = InsertionQueue()
-        self.versions = {}
+        self.audit_service = AuditService()
+        self.metrics_service = MetricsService()
+        self.pricing_service = PricingService()
+        self.queue_service = QueueService(self)
+        self.simulation_service = SimulationService(self)
+        self.version_service = VersionService()
         self.load_mode = None
         self.critical_depth = 999
         self.queue_lock = threading.Lock()
-        self.versions_lock = threading.Lock()
         self.tree_lock = threading.Lock()
         self.simulation_lock = threading.Lock()
         self.simulations = {}
-        self._load_versions_from_disk()
 
     # -------------------------------------------------------------
     # Load / reset
@@ -115,55 +120,15 @@ class TreeService:
 
         flight = Flight.from_dict(flight_data)
         self.avl.insert(Node(flight))
-        self.bst.insert(Node(Flight.from_dict(flight_data)))
+
+        if self.load_mode == "INSERCION":
+            self.bst.insert(Node(Flight.from_dict(flight_data)))
+
         self.recalculate_all_metadata()
         return self.get_tree_response()
 
     def _insert_and_check_conflicts(self, flight_data):
-        """
-        Insert a flight and return the tree response enriched with a conflict report.
-
-        Conflict types detected:
-        - critical_depth: inserted node lands beyond the critical depth threshold.
-        - rotation_triggered: insertion caused at least one AVL rotation.
-        """
-        before_rotations = dict(self.avl.get_rotation_stats())
-
-        self.save_history()
-        flight = Flight.from_dict(flight_data)
-        self.avl.insert(Node(flight))
-        self.bst.insert(Node(Flight.from_dict(flight_data)))
-        self.recalculate_all_metadata()
-
-        after_rotations = dict(self.avl.get_rotation_stats())
-
-        rotation_delta = {
-            k: after_rotations[k] - before_rotations[k]
-            for k in before_rotations
-        }
-        rotation_triggered = any(v > 0 for v in rotation_delta.values())
-
-        key = Flight.from_dict({"codigo": flight_data.get("codigo", "")})
-        inserted_node = self.avl.search(key)
-        critical_depth_hit = (
-            inserted_node is not None and inserted_node.get_value().critical_node
-        )
-
-        conflict_types = []
-        if critical_depth_hit:
-            conflict_types.append("critical_depth")
-        if rotation_triggered:
-            conflict_types.append("rotation_triggered")
-
-        result = self.get_tree_response()
-        result["conflict"] = {
-            "hasConflict": len(conflict_types) > 0,
-            "types": conflict_types,
-            "rotationDelta": rotation_delta,
-            "criticalDepth": critical_depth_hit,
-            "rotationTriggered": rotation_triggered,
-        }
-        return result
+        return self.queue_service._insert_and_check_conflicts(flight_data)
 
     def update_flight(self, code, updates):
         key = Flight.from_dict({"codigo": code})
@@ -193,6 +158,7 @@ class TreeService:
             flight.alert = bool(updates["alerta"])
 
         self.recalculate_all_metadata()
+        self._rebuild_bst_from_avl()
         return self.get_tree_response()
 
     def delete_flight(self, code):
@@ -219,6 +185,7 @@ class TreeService:
         removed = self.avl.cancel(key)
 
         self.recalculate_all_metadata()
+        self._rebuild_bst_from_avl()
         response = self.get_tree_response()
         response["nodesRemoved"] = removed
         return response
@@ -247,6 +214,7 @@ class TreeService:
 
         self.avl.root = previous_root
         self.recalculate_all_metadata()
+        self._rebuild_bst_from_avl()
         return self.get_tree_response()
 
     # -------------------------------------------------------------
@@ -254,427 +222,89 @@ class TreeService:
     # -------------------------------------------------------------
 
     def save_version(self, name):
-        with self.versions_lock:
-            self.versions[name] = JsonSerializer.serialize_tree(self.avl.get_root())
-            keys = list(self.versions.keys())
-
-        self._persist_versions_to_disk()
-
-        return {
-            "saved": name,
-            "versions": keys,
-        }
+        return self.version_service.save_version(name, self.avl.get_root())
 
     def restore_version(self, name):
-        with self.versions_lock:
-            exists = name in self.versions
-
-        if not exists:
-            return {"error": "La versión no existe."}
-
         self.save_history()
+        restore_result = self.version_service.restore_version(name)
 
-        with self.versions_lock:
-            snapshot = self.versions[name]
+        if "error" in restore_result:
+            return restore_result
 
-        if snapshot is None:
-            self.avl.root = None
-        else:
-            self.avl.root = JsonLoader.build_topology_tree(snapshot, None, 0)
+        self.avl.root = restore_result["root"]
 
         self.recalculate_all_metadata()
+        self._rebuild_bst_from_avl()
         response = self.get_tree_response()
         response["restored"] = name
         return response
 
-    def list_versions(self):
-        with self.versions_lock:
-            return list(self.versions.keys())
-
-    def delete_version(self, name):
-        with self.versions_lock:
-            if name not in self.versions:
-                return {"error": "La versión no existe."}
-
-            del self.versions[name]
-            keys = list(self.versions.keys())
-
-        self._persist_versions_to_disk()
-
-        return {
-            "deleted": name,
-            "versions": keys,
-        }
-
-    def _load_versions_from_disk(self):
+    def _rebuild_bst_from_avl(self):
         """
-        Load saved versions from disk into memory on service startup.
-        Silently ignores missing or corrupt files.
+        Rebuild BST from current AVL inorder traversal.
+        Keeps BST consistent after operations that only mutate AVL.
         """
-        path = os.path.abspath(VERSIONS_FILE)
+        self.bst = BST()
 
-        if not os.path.isfile(path):
+        if self.load_mode != "INSERCION":
             return
 
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
+        for flight in self.avl.get_in_order_list():
+            self.bst.insert(Node(Flight.from_dict(flight.to_dict())))
 
-            if isinstance(data, dict):
-                with self.versions_lock:
-                    self.versions = data
+    def list_versions(self):
+        return self.version_service.list_versions()
 
-        except (OSError, json.JSONDecodeError):
-            pass
-
-    def _persist_versions_to_disk(self):
-        """
-        Write all current versions to disk atomically.
-        Uses a .tmp file + rename to avoid partial writes.
-        """
-        path = os.path.abspath(VERSIONS_FILE)
-        tmp_path = path + ".tmp"
-
-        with self.versions_lock:
-            snapshot = dict(self.versions)
-
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as fh:
-                json.dump(snapshot, fh, ensure_ascii=False, indent=2)
-
-            os.replace(tmp_path, path)
-
-        except OSError:
-            pass
+    def delete_version(self, name):
+        return self.version_service.delete_version(name)
 
     # -------------------------------------------------------------
     # Queue
     # -------------------------------------------------------------
 
     def enqueue_flight(self, flight_data):
-        with self.queue_lock:
-            self.queue.enqueue(flight_data)
-            pending = self.queue.to_list()
-
-        return {
-            "queued": len(pending),
-            "pending": pending
-        }
+        return self.queue_service.enqueue_flight(flight_data)
 
     def process_next_in_queue(self):
-        with self.queue_lock:
-            flight_data = self.queue.dequeue()
-
-        if flight_data is None:
-            return {"error": "La cola está vacía."}
-
-        with self.tree_lock:
-            result = self._insert_and_check_conflicts(flight_data)
-
-        with self.queue_lock:
-            remaining = self.queue.size()
-
-        result["inserted"] = flight_data
-        result["remaining"] = remaining
-        return result
+        return self.queue_service.process_next_in_queue()
 
     def process_full_queue(self):
-        inserted_codes = []
-        conflicts = []
-
-        while True:
-            with self.queue_lock:
-                if self.queue.is_empty():
-                    break
-
-                flight_data = self.queue.dequeue()
-
-            with self.tree_lock:
-                insert_result = self._insert_and_check_conflicts(flight_data)
-
-            code = str(flight_data.get("codigo", ""))
-            inserted_codes.append(code)
-
-            if insert_result["conflict"]["hasConflict"]:
-                conflicts.append({
-                    "codigo": code,
-                    "types": insert_result["conflict"]["types"],
-                    "rotationDelta": insert_result["conflict"]["rotationDelta"],
-                    "criticalDepth": insert_result["conflict"]["criticalDepth"],
-                    "rotationTriggered": insert_result["conflict"]["rotationTriggered"],
-                })
-
-        response = self.get_tree_response()
-        response["insertedCodes"] = inserted_codes
-        response["conflicts"] = conflicts
-        return response
+        return self.queue_service.process_full_queue()
 
     def list_queue(self):
-        with self.queue_lock:
-            size = self.queue.size()
-            pending = self.queue.to_list()
-
-        return {
-            "size": size,
-            "pending": pending
-        }
+        return self.queue_service.list_queue()
 
     def remove_from_queue(self, code):
-        with self.queue_lock:
-            removed = self.queue.remove_by_code(code)
-            remaining = self.queue.size()
-
-        if not removed:
-            return {"error": "Ese vuelo no está en la cola."}
-
-        return {
-            "removed": code,
-            "remaining": remaining
-        }
+        return self.queue_service.remove_from_queue(code)
 
     def start_parallel_queue_simulation(self, workers=2, max_items=None, delay_ms=0):
-        workers = int(workers)
-        delay_ms = int(delay_ms)
-
-        if workers <= 0:
-            return {"error": "El número de workers debe ser mayor que cero."}
-
-        if delay_ms < 0:
-            return {"error": "delayMs no puede ser negativo."}
-
-        if max_items is not None:
-            max_items = int(max_items)
-            if max_items <= 0:
-                return {"error": "maxItems debe ser mayor que cero."}
-
-        with self.simulation_lock:
-            for simulation in self.simulations.values():
-                if simulation["status"] == "running":
-                    return {
-                        "error": "Ya existe una simulación activa.",
-                        "activeJobId": simulation["jobId"],
-                    }
-
-        with self.queue_lock:
-            queue_size = self.queue.size()
-
-        if queue_size == 0:
-            return {"error": "La cola está vacía."}
-
-        target_total = queue_size if max_items is None else min(queue_size, max_items)
-        job_id = str(uuid.uuid4())
-        started_at = datetime.utcnow().isoformat() + "Z"
-
-        simulation = {
-            "jobId": job_id,
-            "status": "running",
-            "workers": workers,
-            "delayMs": delay_ms,
-            "maxItems": max_items,
-            "queueSizeAtStart": queue_size,
-            "total": target_total,
-            "claimed": 0,
-            "processed": 0,
-            "inserted": 0,
-            "failed": 0,
-            "warnings": 0,
-            "stopRequested": False,
-            "startedAt": started_at,
-            "endedAt": None,
-            "events": [],
-        }
-
-        worker_threads = []
-
-        with self.simulation_lock:
-            self.simulations[job_id] = simulation
-
-        for worker_id in range(1, workers + 1):
-            thread = threading.Thread(
-                target=self._parallel_simulation_worker,
-                args=(job_id, worker_id),
-                daemon=True,
-            )
-            thread.start()
-            worker_threads.append(thread)
-
-        monitor = threading.Thread(
-            target=self._parallel_simulation_monitor,
-            args=(job_id, worker_threads),
-            daemon=True,
+        return self.simulation_service.start_parallel_queue_simulation(
+            workers,
+            max_items,
+            delay_ms,
         )
-        monitor.start()
-
-        return {
-            "jobId": job_id,
-            "status": "running",
-            "workers": workers,
-            "total": target_total,
-            "queueSizeAtStart": queue_size,
-            "startedAt": started_at,
-        }
 
     def stop_parallel_queue_simulation(self, job_id):
-        with self.simulation_lock:
-            simulation = self.simulations.get(job_id)
-
-            if simulation is None:
-                return {"error": "La simulación no existe."}
-
-            if simulation["status"] != "running":
-                return {
-                    "error": "La simulación no está en ejecución.",
-                    "status": simulation["status"],
-                }
-
-            simulation["stopRequested"] = True
-
-            return {
-                "jobId": job_id,
-                "status": simulation["status"],
-                "stopRequested": True,
-            }
+        return self.simulation_service.stop_parallel_queue_simulation(job_id)
 
     def get_parallel_simulation_status(self, job_id):
-        with self.simulation_lock:
-            simulation = self.simulations.get(job_id)
-
-            if simulation is None:
-                return {"error": "La simulación no existe."}
-
-            return self._build_simulation_status(simulation)
+        return self.simulation_service.get_parallel_simulation_status(job_id)
 
     def list_parallel_simulation_events(self, job_id, offset=0, limit=100):
-        offset = int(offset)
-        limit = int(limit)
-
-        if offset < 0:
-            return {"error": "offset no puede ser negativo."}
-
-        if limit <= 0:
-            return {"error": "limit debe ser mayor que cero."}
-
-        with self.simulation_lock:
-            simulation = self.simulations.get(job_id)
-
-            if simulation is None:
-                return {"error": "La simulación no existe."}
-
-            events = simulation["events"]
-            selected = events[offset:offset + limit]
-
-            return {
-                "jobId": job_id,
-                "status": simulation["status"],
-                "offset": offset,
-                "limit": limit,
-                "totalEvents": len(events),
-                "events": selected,
-            }
+        return self.simulation_service.list_parallel_simulation_events(
+            job_id,
+            offset,
+            limit,
+        )
 
     def _parallel_simulation_worker(self, job_id, worker_id):
-        while True:
-            with self.simulation_lock:
-                simulation = self.simulations.get(job_id)
-
-                if simulation is None:
-                    return
-
-                if simulation["stopRequested"]:
-                    return
-
-                if simulation["claimed"] >= simulation["total"]:
-                    return
-
-                simulation["claimed"] += 1
-                delay_ms = simulation["delayMs"]
-
-            with self.queue_lock:
-                flight_data = self.queue.dequeue()
-
-            if flight_data is None:
-                self._append_simulation_event(
-                    job_id,
-                    worker_id,
-                    None,
-                    "error",
-                    "La cola no tenía suficientes elementos para completar la simulación.",
-                    None,
-                    None,
-                )
-
-                with self.simulation_lock:
-                    simulation = self.simulations.get(job_id)
-                    if simulation is not None:
-                        simulation["processed"] += 1
-                        simulation["failed"] += 1
-                continue
-
-            code = str(flight_data.get("codigo", ""))
-
-            try:
-                with self.tree_lock:
-                    insert_result = self._insert_and_check_conflicts(flight_data)
-                    avl_summary = self.get_avl_summary()
-                    bst_summary = self.get_bst_summary()
-
-                conflict = insert_result["conflict"]
-
-                self._append_simulation_event(
-                    job_id,
-                    worker_id,
-                    code,
-                    "inserted",
-                    None,
-                    avl_summary,
-                    bst_summary,
-                    conflict=conflict,
-                )
-
-                with self.simulation_lock:
-                    simulation = self.simulations.get(job_id)
-                    if simulation is not None:
-                        simulation["processed"] += 1
-                        simulation["inserted"] += 1
-                        if conflict["hasConflict"]:
-                            simulation["warnings"] += 1
-
-            except ValueError as error:
-                self._append_simulation_event(
-                    job_id,
-                    worker_id,
-                    code,
-                    "error",
-                    str(error),
-                    None,
-                    None,
-                )
-
-                with self.simulation_lock:
-                    simulation = self.simulations.get(job_id)
-                    if simulation is not None:
-                        simulation["processed"] += 1
-                        simulation["failed"] += 1
-
-            if delay_ms > 0:
-                time.sleep(delay_ms / 1000.0)
+        return self.simulation_service._parallel_simulation_worker(job_id, worker_id)
 
     def _parallel_simulation_monitor(self, job_id, worker_threads):
-        for thread in worker_threads:
-            thread.join()
-
-        with self.simulation_lock:
-            simulation = self.simulations.get(job_id)
-
-            if simulation is None:
-                return
-
-            simulation["endedAt"] = datetime.utcnow().isoformat() + "Z"
-
-            if simulation["stopRequested"]:
-                simulation["status"] = "stopped"
-            else:
-                simulation["status"] = "completed"
+        return self.simulation_service._parallel_simulation_monitor(
+            job_id,
+            worker_threads,
+        )
 
     def _append_simulation_event(
         self,
@@ -687,46 +317,19 @@ class TreeService:
         bst_summary,
         conflict=None,
     ):
-        event = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "workerId": worker_id,
-            "codigo": code,
-            "result": result,
-            "message": message,
-            "avl": avl_summary,
-            "bst": bst_summary,
-            "conflict": conflict,
-        }
-
-        with self.simulation_lock:
-            simulation = self.simulations.get(job_id)
-            if simulation is not None:
-                simulation["events"].append(event)
+        return self.simulation_service._append_simulation_event(
+            job_id,
+            worker_id,
+            code,
+            result,
+            message,
+            avl_summary,
+            bst_summary,
+            conflict=conflict,
+        )
 
     def _build_simulation_status(self, simulation):
-        progress = 0.0
-        if simulation["total"] > 0:
-            progress = round((simulation["processed"] / simulation["total"]) * 100.0, 2)
-
-        return {
-            "jobId": simulation["jobId"],
-            "status": simulation["status"],
-            "workers": simulation["workers"],
-            "delayMs": simulation["delayMs"],
-            "maxItems": simulation["maxItems"],
-            "queueSizeAtStart": simulation["queueSizeAtStart"],
-            "total": simulation["total"],
-            "claimed": simulation["claimed"],
-            "processed": simulation["processed"],
-            "inserted": simulation["inserted"],
-            "failed": simulation["failed"],
-            "warnings": simulation["warnings"],
-            "stopRequested": simulation["stopRequested"],
-            "startedAt": simulation["startedAt"],
-            "endedAt": simulation["endedAt"],
-            "progressPercent": progress,
-            "lastEvents": simulation["events"][-10:],
-        }
+        return self.simulation_service._build_simulation_status(simulation)
 
     # -------------------------------------------------------------
     # Export
@@ -743,22 +346,22 @@ class TreeService:
     # -------------------------------------------------------------
 
     def enable_stress_mode(self):
-        self.avl.enable_stress_mode()
-        return {"stressMode": True}
+        return self.audit_service.enable_stress_mode(self.avl)
 
     def disable_stress_mode(self):
-        self.avl.disable_stress_mode()
-        return {"stressMode": False}
+        return self.audit_service.disable_stress_mode(self.avl)
 
     def audit_avl(self):
-        if not self.avl.stress_mode:
-            return {"error": "La auditoría solo está disponible en modo estrés."}
-
-        return self.avl.audit_avl()
+        return self.audit_service.audit_avl(self.avl)
 
     def global_rebalance(self):
         self.save_history()
-        rotation_stats = self.avl.global_rebalance()
+        rotation_stats = self.audit_service.global_rebalance(self.avl)
+
+        if isinstance(rotation_stats, dict) and "error" in rotation_stats:
+            return rotation_stats
+
+        self.avl.disable_stress_mode()
         self.recalculate_all_metadata()
 
         response = self.get_tree_response()
@@ -771,23 +374,28 @@ class TreeService:
     # -------------------------------------------------------------
 
     def set_critical_depth(self, depth):
-        self.critical_depth = int(depth)
-        self.recalculate_all_metadata()
+        set_result = self.pricing_service.set_critical_depth(
+            self.avl,
+            depth,
+        )
+
+        if isinstance(set_result, dict) and "error" in set_result:
+            return set_result
+
+        self.critical_depth = set_result
 
         response = self.get_tree_response()
         response["criticalDepth"] = self.critical_depth
         return response
 
     def eliminate_least_profitable(self):
-        if self.avl.get_root() is None:
-            return {"error": "El árbol está vacío."}
+        target_result = self.pricing_service.eliminate_least_profitable(self.avl)
 
-        target = self.find_least_profitable_node()
-        if target is None:
-            return {"error": "No se encontró un nodo candidato."}
+        if "error" in target_result:
+            return target_result
 
-        code = target.get_value().get_code()
-        rentability = target.get_value().rentability
+        code = target_result["code"]
+        rentability = target_result["rentability"]
 
         result = self.cancel_flight(code)
         result["cancelledCode"] = code
@@ -795,108 +403,38 @@ class TreeService:
         return result
 
     def find_least_profitable_node(self):
-        candidates = []
-        self.collect_rentability(self.avl.get_root(), candidates)
-
-        if len(candidates) == 0:
-            return None
-
-        best = candidates[0]
-
-        for candidate in candidates[1:]:
-            if candidate[0] < best[0]:
-                best = candidate
-            elif candidate[0] == best[0]:
-                if candidate[1] > best[1]:
-                    best = candidate
-                elif candidate[1] == best[1]:
-                    if candidate[2] > best[2]:
-                        best = candidate
-
-        return best[3]
+        return self.pricing_service.find_least_profitable_node(self.avl)
 
     def collect_rentability(self, node, result):
-        if node is None:
-            return
-
-        flight = node.get_value()
-        result.append((
-            flight.rentability,
-            flight.depth,
-            flight.code,
-            node
-        ))
-
-        self.collect_rentability(node.get_left_child(), result)
-        self.collect_rentability(node.get_right_child(), result)
+        return self.pricing_service.collect_rentability(node, result)
 
     # -------------------------------------------------------------
     # Metrics / summaries
     # -------------------------------------------------------------
 
     def get_metrics(self):
-        root = self.avl.get_root()
-        has_root = root is not None
-
-        return {
-            "height": self.avl.calculate_height(root) + 1 if has_root else 0,
-            "totalNodes": self.avl.count_nodes(),
-            "leafCount": self.avl.count_leaves(),
-            "rotations": self.avl.get_rotation_stats(),
-            "massCancellations": self.avl.mass_cancellations,
-            "stressMode": self.avl.stress_mode,
-            "criticalDepth": self.critical_depth,
-            "bfs": [flight.to_dict() for flight in self.avl.get_breadth_first_list()],
-            "dfs": [flight.to_dict() for flight in self.avl.get_pre_order_list()],
-            "inorder": [flight.to_dict() for flight in self.avl.get_in_order_list()],
-        }
+        return self.metrics_service.get_metrics(self.avl, self.critical_depth)
 
     def get_avl_summary(self):
-        root = self.avl.get_root()
-
-        return {
-            "raiz": root.get_value().get_code() if root is not None else None,
-            "profundidad": self.avl.calculate_height(root) + 1 if root is not None else 0,
-            "cantidadHojas": self.avl.count_leaves(),
-            "totalNodos": self.avl.count_nodes(),
-            "rotaciones": self.avl.get_rotation_stats(),
-        }
+        return self.metrics_service.get_avl_summary(self.avl)
 
     def get_bst_summary(self):
-        root = self.bst.get_root()
-
-        return {
-            "raiz": root.get_value().get_code() if root is not None else None,
-            "profundidad": self.bst.calculate_height(root) + 1 if root is not None else 0,
-            "cantidadHojas": self.bst.count_leaves(),
-            "totalNodos": self.bst.count_nodes(),
-        }
+        return self.metrics_service.get_bst_summary(self.bst)
 
     def get_tree_response(self):
-        return {
-            "tree": JsonSerializer.serialize_tree(self.avl.get_root()),
-            "properties": self.get_avl_summary()
-        }
+        return self.metrics_service.get_tree_response(self.avl)
 
     # -------------------------------------------------------------
     # Metadata recalculation
     # -------------------------------------------------------------
 
     def recalculate_all_metadata(self):
-        self.recalculate_metadata_from_node(self.avl.get_root(), 0)
+        self.pricing_service.recalculate_all_metadata(self.avl, self.critical_depth)
 
     def recalculate_metadata_from_node(self, node, depth):
-        if node is None:
-            return
-
-        flight = node.get_value()
-
-        flight.depth = depth
-        flight.height = self.avl.calculate_height(node)
-        flight.balance_factor = self.avl.get_balance_factor(node)
-
-        flight.compute_final_price(self.critical_depth)
-        flight.compute_rentability()
-
-        self.recalculate_metadata_from_node(node.get_left_child(), depth + 1)
-        self.recalculate_metadata_from_node(node.get_right_child(), depth + 1)
+        self.pricing_service.recalculate_metadata_from_node(
+            self.avl,
+            node,
+            depth,
+            self.critical_depth,
+        )
