@@ -158,6 +158,7 @@ class TreeService:
             flight.alert = bool(updates["alerta"])
 
         self.recalculate_all_metadata()
+        self._rebuild_bst_from_avl()
         return self.get_tree_response()
 
     def delete_flight(self, code):
@@ -184,6 +185,7 @@ class TreeService:
         removed = self.avl.cancel(key)
 
         self.recalculate_all_metadata()
+        self._rebuild_bst_from_avl()
         response = self.get_tree_response()
         response["nodesRemoved"] = removed
         return response
@@ -212,6 +214,7 @@ class TreeService:
 
         self.avl.root = previous_root
         self.recalculate_all_metadata()
+        self._rebuild_bst_from_avl()
         return self.get_tree_response()
 
     # -------------------------------------------------------------

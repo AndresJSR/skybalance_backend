@@ -350,27 +350,128 @@ class AVL:
 
     def global_rebalance(self):
         """
-        Rebuild tree from its in-order traversal.
-        Returns the rotation count difference produced during rebuild.
+        Rebalance the current tree in place by cascading local rotations.
+        Detects unbalanced nodes explicitly while traversing the tree.
         """
-        values = self.get_in_order_list()
-
         before = dict(self.rotation_count)
+        stats = {
+            "unbalancedNodesDetected": 0,
+        }
 
-        self.root = None
+        self.root = self.__rebalance_subtree(self.root, stats)
         self.stress_mode = False
 
-        for value in values:
-            self.insert(Node(value))
-
         after = dict(self.rotation_count)
-
-        return {
+        rotations_applied = {
             "LL": after["LL"] - before["LL"],
             "RR": after["RR"] - before["RR"],
             "LR": after["LR"] - before["LR"],
             "RL": after["RL"] - before["RL"]
         }
+
+        return {
+            "LL": rotations_applied["LL"],
+            "RR": rotations_applied["RR"],
+            "LR": rotations_applied["LR"],
+            "RL": rotations_applied["RL"],
+            "unbalancedNodesDetected": stats["unbalancedNodesDetected"],
+            "totalRotations": (
+                rotations_applied["LL"]
+                + rotations_applied["RR"]
+                + rotations_applied["LR"]
+                + rotations_applied["RL"]
+            ),
+            "strategy": "cascading-rotations"
+        }
+
+    def __rebalance_subtree(self, node, stats):
+        """
+        Rebalance subtree bottom-up so rotations cascade naturally.
+        Returns the new root of this subtree.
+        """
+        if node is None:
+            return None
+
+        left = self.__rebalance_subtree(node.get_left_child(), stats)
+        right = self.__rebalance_subtree(node.get_right_child(), stats)
+
+        node.set_left_child(left)
+        if left is not None:
+            left.set_parent(node)
+
+        node.set_right_child(right)
+        if right is not None:
+            right.set_parent(node)
+
+        detected_here = False
+
+        while True:
+            balance_factor = self.get_balance_factor(node)
+
+            if -1 <= balance_factor <= 1:
+                break
+
+            if not detected_here:
+                stats["unbalancedNodesDetected"] += 1
+                detected_here = True
+
+            case = self.__identify_rebalance_case(node, balance_factor)
+
+            if case == "LL":
+                node = self.__rotate_right_local(node)
+                self.rotation_count["LL"] += 1
+                continue
+
+            if case == "RR":
+                node = self.__rotate_left_local(node)
+                self.rotation_count["RR"] += 1
+                continue
+
+            if case == "LR":
+                rotated_left = self.__rotate_left_local(node.get_left_child())
+                node.set_left_child(rotated_left)
+                rotated_left.set_parent(node)
+                node = self.__rotate_right_local(node)
+                self.rotation_count["LR"] += 1
+                continue
+
+            rotated_right = self.__rotate_right_local(node.get_right_child())
+            node.set_right_child(rotated_right)
+            rotated_right.set_parent(node)
+            node = self.__rotate_left_local(node)
+            self.rotation_count["RL"] += 1
+
+        return node
+
+    def __rotate_left_local(self, top_node):
+        """Rotate subtree left and return its new root."""
+        middle_node = top_node.get_right_child()
+        transfer_subtree = middle_node.get_left_child()
+
+        middle_node.set_left_child(top_node)
+        top_node.set_parent(middle_node)
+
+        top_node.set_right_child(transfer_subtree)
+        if transfer_subtree is not None:
+            transfer_subtree.set_parent(top_node)
+
+        middle_node.set_parent(None)
+        return middle_node
+
+    def __rotate_right_local(self, top_node):
+        """Rotate subtree right and return its new root."""
+        middle_node = top_node.get_left_child()
+        transfer_subtree = middle_node.get_right_child()
+
+        middle_node.set_right_child(top_node)
+        top_node.set_parent(middle_node)
+
+        top_node.set_left_child(transfer_subtree)
+        if transfer_subtree is not None:
+            transfer_subtree.set_parent(top_node)
+
+        middle_node.set_parent(None)
+        return middle_node
 
     # -------------------------------------------------------------
     # AVL audit
@@ -378,7 +479,7 @@ class AVL:
 
     def audit_avl(self):
         """
-        Verify AVL property in all nodes.
+        Verify AVL property and metadata consistency in all nodes.
         Returns a report.
         """
         issues = []
@@ -394,14 +495,57 @@ class AVL:
         if node is None:
             return
 
-        balance_factor = self.get_balance_factor(node)
+        flight = node.get_value()
+        calculated_height = self.calculate_height(node)
+        calculated_balance_factor = self.get_balance_factor(node)
 
-        if balance_factor < -1 or balance_factor > 1:
-            issues.append({
-                "code": node.get_value().get_code(),
-                "balanceFactor": balance_factor,
-                "height": self.calculate_height(node)
-            })
+        stored_height = getattr(flight, "height", None)
+        # Backward-compatible lookup for legacy naming.
+        stored_balance_factor = getattr(
+            flight,
+            "balance_factor",
+            getattr(flight, "balanceFactor", None),
+        )
+
+        is_structurally_unbalanced = (
+            calculated_balance_factor < -1 or calculated_balance_factor > 1
+        )
+        missing_height_metadata = stored_height is None
+        missing_balance_metadata = stored_balance_factor is None
+        has_height_mismatch = (
+            not missing_height_metadata and stored_height != calculated_height
+        )
+        has_balance_mismatch = (
+            not missing_balance_metadata
+            and stored_balance_factor != calculated_balance_factor
+        )
+
+        if (
+            is_structurally_unbalanced
+            or missing_height_metadata
+            or missing_balance_metadata
+            or has_height_mismatch
+            or has_balance_mismatch
+        ):
+            issue = {
+                "code": flight.get_code(),
+                "balanceFactor": calculated_balance_factor,
+                "height": calculated_height,
+            }
+
+            if missing_height_metadata:
+                issue["missingStoredHeight"] = True
+
+            if missing_balance_metadata:
+                issue["missingStoredBalanceFactor"] = True
+
+            if has_height_mismatch:
+                issue["storedHeight"] = stored_height
+
+            if has_balance_mismatch:
+                issue["storedBalanceFactor"] = stored_balance_factor
+
+            issues.append(issue)
 
         self.__audit(node.get_left_child(), issues)
         self.__audit(node.get_right_child(), issues)
