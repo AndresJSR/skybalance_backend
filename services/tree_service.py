@@ -424,6 +424,27 @@ class TreeService:
     def get_tree_response(self):
         return self.metrics_service.get_tree_response(self.avl)
 
+    def get_comparative_snapshot(self):
+        """
+        Return the current AVL/BST comparative snapshot.
+
+        In TOPOLOGIA mode (or before any load), BST is not part of the
+        active comparison and is returned as None.
+        """
+        is_insertion_mode = self.load_mode == "INSERCION"
+
+        return {
+            "mode": self.load_mode,
+            "avl": self.get_avl_summary(),
+            "bst": self.get_bst_summary() if is_insertion_mode else None,
+            "avlTree": JsonSerializer.serialize_tree(self.avl.get_root()),
+            "bstTree": (
+                JsonSerializer.serialize_tree(self.bst.get_root())
+                if is_insertion_mode
+                else None
+            ),
+        }
+
     # -------------------------------------------------------------
     # Metadata recalculation
     # -------------------------------------------------------------

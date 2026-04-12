@@ -13,6 +13,7 @@ from routes.metrics import metrics_bp
 from routes.export import export_bp
 from routes.undo import undo_bp
 from routes.business import business_bp
+from routes.comparison import comparison_bp
 
 
 def create_app():
@@ -39,6 +40,7 @@ def create_app():
     app.register_blueprint(export_bp)
     app.register_blueprint(undo_bp)
     app.register_blueprint(business_bp)
+    app.register_blueprint(comparison_bp)
 
     return app
 
