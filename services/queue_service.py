@@ -36,7 +36,7 @@ class QueueService:
 		result["remaining"] = remaining
 		return result
 
-	def process_full_queue(self):
+	def process_full_queue(self, save_snapshot=True):
 		inserted_codes = []
 		conflicts = []
 
@@ -48,7 +48,10 @@ class QueueService:
 				flight_data = self.tree_service.queue.dequeue()
 
 			with self.tree_service.tree_lock:
-				insert_result = self._insert_and_check_conflicts(flight_data)
+				insert_result = self._insert_and_check_conflicts(
+					flight_data,
+					save_snapshot=save_snapshot,
+				)
 
 			code = str(flight_data.get("codigo", ""))
 			inserted_codes.append(code)
@@ -90,7 +93,7 @@ class QueueService:
 			"remaining": remaining,
 		}
 
-	def _insert_and_check_conflicts(self, flight_data):
+	def _insert_and_check_conflicts(self, flight_data, save_snapshot=True):
 		"""
 		Insert a flight and return the tree response enriched with a conflict report.
 
@@ -100,7 +103,10 @@ class QueueService:
 		"""
 		before_rotations = dict(self.tree_service.avl.get_rotation_stats())
 
-		result = self.tree_service.insert_flight(flight_data)
+		result = self.tree_service.insert_flight(
+			flight_data,
+			save_snapshot=save_snapshot,
+		)
 
 		after_rotations = dict(self.tree_service.avl.get_rotation_stats())
 

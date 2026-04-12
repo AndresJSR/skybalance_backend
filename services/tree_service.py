@@ -115,8 +115,9 @@ class TreeService:
     # CRUD
     # -------------------------------------------------------------
 
-    def insert_flight(self, flight_data):
-        self.save_history()
+    def insert_flight(self, flight_data, save_snapshot=True):
+        if save_snapshot:
+            self.save_history()
 
         flight = Flight.from_dict(flight_data)
         self.avl.insert(Node(flight))
@@ -269,7 +270,9 @@ class TreeService:
         return self.queue_service.process_next_in_queue()
 
     def process_full_queue(self):
-        return self.queue_service.process_full_queue()
+        # Batch queue processing must be undoable in a single step.
+        self.save_history()
+        return self.queue_service.process_full_queue(save_snapshot=False)
 
     def list_queue(self):
         return self.queue_service.list_queue()
