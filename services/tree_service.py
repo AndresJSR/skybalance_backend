@@ -392,6 +392,14 @@ class TreeService:
         return response
 
     def eliminate_least_profitable(self):
+        if self.avl.stress_mode:
+            return {
+                "error": (
+                    "No se puede eliminar por menor rentabilidad en modo estrés. "
+                    "Desactive el modo estrés para garantizar rebalanceo."
+                )
+            }
+
         target_result = self.pricing_service.eliminate_least_profitable(self.avl)
 
         if "error" in target_result:

@@ -4,6 +4,22 @@
 class PricingService:
 	"""Encapsulates critical depth, rentability, and metadata recalculation logic."""
 
+	def _code_sort_key(self, code):
+		"""
+		Build a robust comparison key for flight codes.
+
+		Preference order:
+		1) Numeric part when present (higher is considered larger code).
+		2) Lexicographic fallback for non-numeric or tied numeric values.
+		"""
+		code_text = str(code)
+		digits = "".join(ch for ch in code_text if ch.isdigit())
+
+		if digits:
+			return (1, int(digits), code_text)
+
+		return (0, -1, code_text)
+
 	def set_critical_depth(self, avl, depth):
 		try:
 			depth_value = int(depth)
@@ -42,7 +58,7 @@ class PricingService:
 				if candidate[1] > best[1]:
 					best = candidate
 				elif candidate[1] == best[1]:
-					if candidate[2] > best[2]:
+					if self._code_sort_key(candidate[2]) > self._code_sort_key(best[2]):
 						best = candidate
 
 		return best[3]
