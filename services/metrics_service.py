@@ -21,6 +21,7 @@ class MetricsService:
 			"bfs": [flight.to_dict() for flight in avl.get_breadth_first_list()],
 			"dfs": [flight.to_dict() for flight in avl.get_pre_order_list()],
 			"inorder": [flight.to_dict() for flight in avl.get_in_order_list()],
+			"postorder": [flight.to_dict() for flight in avl.get_post_order_list()],
 		}
 
 	def get_avl_summary(self, avl):
