@@ -19,9 +19,13 @@ class VersionService:
 		self.versions_lock = threading.Lock()
 		self._load_versions_from_disk()
 
-	def save_version(self, name, root):
+	def save_version(self, name, root, critical_depth, load_mode):
 		with self.versions_lock:
-			self.versions[name] = JsonSerializer.serialize_tree(root)
+			self.versions[name] = {
+				"snapshot": JsonSerializer.serialize_tree(root),
+				"criticalDepth": critical_depth,
+				"loadMode": load_mode,
+			}
 			keys = list(self.versions.keys())
 
 		self._persist_versions_to_disk()
@@ -42,10 +46,27 @@ class VersionService:
 			snapshot = self.versions[name]
 
 		if snapshot is None:
-			return {"root": None}
+			return {"root": None, "criticalDepth": None, "loadMode": None, "hasContext": True}
 
-		root = JsonLoader.build_topology_tree(snapshot, None, 0)
-		return {"root": root}
+		if isinstance(snapshot, dict) and "snapshot" in snapshot:
+			root_data = snapshot.get("snapshot")
+			critical_depth = snapshot.get("criticalDepth")
+			load_mode = snapshot.get("loadMode")
+			has_context = True
+		else:
+			# Backward compatibility for legacy versions that only stored the tree.
+			root_data = snapshot
+			critical_depth = None
+			load_mode = None
+			has_context = False
+
+		root = JsonLoader.build_topology_tree(root_data, None, 0)
+		return {
+			"root": root,
+			"criticalDepth": critical_depth,
+			"loadMode": load_mode,
+			"hasContext": has_context,
+		}
 
 	def restore_version_root(self, name):
 		"""Backward-compatible alias for existing callers."""

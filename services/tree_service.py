@@ -223,7 +223,12 @@ class TreeService:
     # -------------------------------------------------------------
 
     def save_version(self, name):
-        return self.version_service.save_version(name, self.avl.get_root())
+        return self.version_service.save_version(
+            name,
+            self.avl.get_root(),
+            self.critical_depth,
+            self.load_mode,
+        )
 
     def restore_version(self, name):
         self.save_history()
@@ -234,10 +239,22 @@ class TreeService:
 
         self.avl.root = restore_result["root"]
 
+        has_context = restore_result.get("hasContext", False)
+        restored_critical_depth = restore_result.get("criticalDepth")
+        restored_load_mode = restore_result.get("loadMode")
+
+        if has_context and restored_critical_depth is not None:
+            self.critical_depth = restored_critical_depth
+
+        if has_context:
+            self.load_mode = restored_load_mode
+
         self.recalculate_all_metadata()
         self._rebuild_bst_from_avl()
         response = self.get_tree_response()
         response["restored"] = name
+        response["criticalDepth"] = self.critical_depth
+        response["mode"] = self.load_mode
         return response
 
     def _rebuild_bst_from_avl(self):
